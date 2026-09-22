@@ -63,6 +63,7 @@ pytest
 | `POST` | `/api/validations` | 对某导入批次发起校验（后台任务）→ `validation_id` |
 | `GET` | `/api/validations` | 最近校验任务列表 |
 | `GET` | `/api/validations/{validation_id}` | 任务状态 + 诊断（`?type=`、`?path=` 过滤） |
+| `GET` | `/api/validations/{validation_id}/sarif` | SARIF 2.1.0 导出（任务须为 `done`） |
 | `POST` | `/api/validations/{validation_id}/fix-preview` | 修复预览（任务须为 `done`） |
 
 ### 示例
@@ -87,6 +88,9 @@ curl 'localhost:8000/api/validations/<validation_id>?type=broken_link&path=READM
 
 # 4. 修复预览
 curl -X POST localhost:8000/api/validations/<validation_id>/fix-preview
+
+# 5. SARIF 2.1.0 导出（Content-Type: application/sarif+json）
+curl localhost:8000/api/validations/<validation_id>/sarif -o results.sarif
 ```
 
 修复预览响应：
@@ -110,6 +114,25 @@ curl -X POST localhost:8000/api/validations/<validation_id>/fix-preview
 }
 ```
 
+## SARIF 导出
+
+`GET /api/validations/{validation_id}/sarif` 返回符合
+[SARIF 2.1.0](https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html)
+的报告，媒体类型为 `application/sarif+json`，可直接导入 GitHub code scanning、
+VS Code SARIF Viewer 等工具：
+
+- 每个校验任务对应一个 `run`，四类诊断在 `tool.driver.rules` 中有稳定的规则定义：
+  `broken_link`（error）、`broken_anchor`（error）、`anchor_collision`（warning
+  默认；显式锚点重复定义时结果级别覆盖为 error）、`cycle`（warning）。
+- 每个结果保留文档路径（`physicalLocation.artifactLocation.uri`，相对路径，
+  空格等字符按 URI 百分号编码）、1-based 行号（`region.startLine`；循环为
+  文档级诊断，无 region）、`ruleId`/`ruleIndex`、与接口一致的可定位 `message`，
+  原始诊断信息放在 `properties.details` 中。
+- 结果按（文档路径、行号、规则、消息）确定性排序，行号缺失的文档级诊断排在最前；
+  重复导出逐字节一致。
+- 仅 `done` 状态可导出：校验不存在返回 `404`，`pending`/`running`/`failed`
+  返回 `409` 并在 `detail` 中说明当前状态。
+
 ## 解析规则与已知限制
 
 - 锚点生成遵循 GitHub 规则：小写、去标点、空白转 `-`，重复标题自动追加 `-1`、`-2`；
@@ -130,6 +153,7 @@ app/
   parser.py    # Markdown 解析：标题/锚点/链接/代码块
   analyzer.py  # 引用图构建与诊断（断链/断锚/碰撞/环）
   fixer.py     # 修复预览：最小化重写锚点与引用
+  sarif.py     # SARIF 2.1.0 导出：诊断 -> runs/results 映射
   db.py        # SQLite 持久层（imports / documents / validations / diagnostics）
   schemas.py   # 请求模型与路径校验
 tests/

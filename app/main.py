@@ -1,13 +1,15 @@
 """FastAPI application: document import, validation tasks, fix preview."""
 from __future__ import annotations
 
+import json
 from contextlib import asynccontextmanager
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Response
 
 from . import db
 from .analyzer import analyze
 from .fixer import build_fix_preview
+from .sarif import build_sarif
 from .schemas import ImportRequest, ValidationRequest, normalize_doc_path
 
 
@@ -150,6 +152,31 @@ def get_validation(
             for d in diagnostics
         ],
     }
+
+
+# ------------------------------------------------------------------ sarif ---
+
+SARIF_MEDIA_TYPE = "application/sarif+json"
+
+
+@app.get("/api/validations/{validation_id}/sarif")
+def export_validation_sarif(validation_id: str) -> Response:
+    v = db.get_validation(validation_id)
+    if not v:
+        raise HTTPException(status_code=404, detail="validation not found")
+    if v["status"] != "done":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"validation is {v['status']}; SARIF export requires status 'done'"
+            ),
+        )
+    diagnostics = db.list_diagnostics(validation_id)
+    report = build_sarif(v, diagnostics)
+    return Response(
+        content=json.dumps(report, ensure_ascii=False),
+        media_type=SARIF_MEDIA_TYPE,
+    )
 
 
 # ------------------------------------------------------------ fix preview ---

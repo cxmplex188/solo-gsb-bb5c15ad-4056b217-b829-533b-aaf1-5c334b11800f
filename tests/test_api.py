@@ -280,3 +280,150 @@ def test_crlf_preserved_in_fix_preview(client):
     fixed = preview["fixed_documents"][0]["fixed_content"]
     assert "\r\n" in fixed
     assert fixed.split("\r\n")[4] == "## Dup  {#dup-1}"
+
+
+# --------------------------------------------------------------- sarif -----
+
+def test_sarif_export_maps_all_diagnostics(client):
+    _, vid, body = import_and_validate(client, CORPUS)
+    r = client.get(f"/api/validations/{vid}/sarif")
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"].startswith("application/sarif+json")
+
+    log = r.json()
+    assert log["version"] == "2.1.0"
+    assert log["$schema"].startswith("https://") and log["$schema"].endswith(".json")
+    assert len(log["runs"]) == 1
+
+    run = log["runs"][0]
+    assert run["tool"]["driver"]["name"]
+    assert run["tool"]["driver"]["version"]
+    assert run["invocations"] == [{"executionSuccessful": True}]
+    assert run["automationDetails"] == {"id": f"validation/{vid}"}
+
+    rules = run["tool"]["driver"]["rules"]
+    rule_ids = [rule["id"] for rule in rules]
+    assert rule_ids == [
+        "broken_link",
+        "broken_anchor",
+        "anchor_collision",
+        "cycle",
+    ]
+    rule_index = {rule["id"]: i for i, rule in enumerate(rules)}
+
+    results = run["results"]
+    assert len(results) == body["summary"]["diagnostics"] == 8
+
+    by_rule: dict[str, list] = {}
+    for res in results:
+        by_rule.setdefault(res["ruleId"], []).append(res)
+        # ruleId/ruleIndex consistently reference the run-level rule table
+        assert res["ruleIndex"] == rule_index[res["ruleId"]]
+        loc = res["locations"][0]["physicalLocation"]
+        assert "uri" in loc["artifactLocation"]
+
+    # severity -> SARIF level mapping
+    assert all(res["level"] == "error" for res in by_rule["broken_link"])
+    assert all(res["level"] == "error" for res in by_rule["broken_anchor"])
+    assert all(res["level"] == "warning" for res in by_rule["cycle"])
+    # the CORPUS collision is the auto-disambiguation warning
+    assert [res["level"] for res in by_rule["anchor_collision"]] == ["warning"]
+
+    # paths, lines and messages are preserved and locatable
+    broken = {(
+        res["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+        res["locations"][0]["physicalLocation"]["region"]["startLine"],
+    ): res for res in by_rule["broken_link"]}
+    assert set(broken) == {("index.md", 3), ("docs/guide.md", 9)}
+    res = broken[("index.md", 3)]
+    assert "docs/nope.md" in res["message"]["text"]
+    assert res["properties"]["severity"] == "error"
+    assert res["properties"]["details"]["resolved"] == "docs/nope.md"
+
+    # cycle diagnostics are document-level: no region, but still located
+    for res in by_rule["cycle"]:
+        loc = res["locations"][0]["physicalLocation"]
+        assert "region" not in loc
+        assert loc["artifactLocation"]["uri"] in {
+            "index.md",
+            "docs/guide.md",
+            "docs/api.md",
+        }
+        assert "circular reference detected" in res["message"]["text"]
+        assert res["properties"]["details"]["cycle"]
+
+
+def test_sarif_error_level_collision_overrides_rule_default(client):
+    # duplicate explicit anchors are errors even though the rule defaults to warning
+    corpus = {"a.md": "# H {#dup}\n\n# J {#dup}\n"}
+    _, vid, _ = import_and_validate(client, corpus)
+    log = client.get(f"/api/validations/{vid}/sarif").json()
+    results = log["runs"][0]["results"]
+    assert len(results) == 1
+    assert results[0]["ruleId"] == "anchor_collision"
+    assert results[0]["level"] == "error"
+    assert results[0]["locations"][0]["physicalLocation"]["region"] == {
+        "startLine": 3
+    }
+
+
+def test_sarif_results_are_stable_and_sorted(client):
+    _, vid, _ = import_and_validate(client, CORPUS)
+    first = client.get(f"/api/validations/{vid}/sarif").json()
+    second = client.get(f"/api/validations/{vid}/sarif").json()
+    assert first == second  # byte-identical re-export
+
+    keys = [
+        (
+            res["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+            res["locations"][0]["physicalLocation"].get("region", {}).get(
+                "startLine", -1
+            ),
+            res["ruleId"],
+            res["message"]["text"],
+        )
+        for res in first["runs"][0]["results"]
+    ]
+    assert keys == sorted(keys)
+
+
+def test_sarif_percent_encodes_artifact_uris(client):
+    corpus = {"my docs/a.md": "# A\n\n[x](missing.md).\n"}
+    _, vid, _ = import_and_validate(client, corpus)
+    log = client.get(f"/api/validations/{vid}/sarif").json()
+    result = log["runs"][0]["results"][0]
+    assert result["ruleId"] == "broken_link"
+    uri = result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+    assert uri == "my%20docs/a.md"
+
+
+def test_sarif_empty_when_validation_is_clean(client):
+    _, vid, _ = import_and_validate(client, {"a.md": "# A\n\nText only.\n"})
+    log = client.get(f"/api/validations/{vid}/sarif").json()
+    assert log["version"] == "2.1.0"
+    assert log["runs"][0]["results"] == []
+    assert [r["id"] for r in log["runs"][0]["tool"]["driver"]["rules"]]
+
+
+def test_sarif_unknown_validation_returns_404(client):
+    r = client.get("/api/validations/does-not-exist/sarif")
+    assert r.status_code == 404
+    assert r.json()["detail"] == "validation not found"
+
+
+def test_sarif_requires_done_status(client):
+    from app import db
+
+    import_id = db.create_import({"a.md": "# A\n"})
+    vid = db.create_validation(import_id)  # stays 'pending'
+    r = client.get(f"/api/validations/{vid}/sarif")
+    assert r.status_code == 409
+    assert "pending" in r.json()["detail"]
+
+    db.set_validation_running(vid)
+    assert client.get(f"/api/validations/{vid}/sarif").status_code == 409
+
+    db.finish_validation(vid, "failed", error="boom")
+    r = client.get(f"/api/validations/{vid}/sarif")
+    assert r.status_code == 409
+    assert "failed" in r.json()["detail"]
