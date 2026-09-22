@@ -20,6 +20,12 @@ Markdown 文档，服务解析相对链接、标题锚点与代码块，建立�
   | `anchor_collision` | warning/error | 多个标题共享同一锚点（歧义）或锚点重复定义 |
   | `cycle` | warning | 文档间循环引用（强连通分量，含自引用） |
 - **校验任务**：校验在后台任务中执行，可查询任务状态与诊断（支持按类型/路径过滤）。
+- **SARIF 导出**：已完成校验可导出为 [SARIF 2.1.0](https://sarifweb.azurewebsites.net/)
+  （`GET /api/validations/{validation_id}/sarif`，`application/sarif+json`），
+  断链/断锚/锚点碰撞/循环分别映射为四条规则的 results，保留文档路径（artifact
+  location URI）、行号（region，循环为文档级诊断无行号）、规则标识与严重级别，
+  诊断明细（解析后的目标、片段、候选锚点、环路成员等）放入 `properties`，结果顺序
+  按路径/行号稳定排列，可直接接入 GitHub code scanning 等工具。
 - **修复预览**：返回受影响文档的逐行变更与完整修复后内容，**不改写代码块与正文**：
   - 锚点碰撞 → 为重复标题补充显式锚点 `{#id}`（尽量保持原锚点值不变）；
   - 断锚 → 以最相似的目标锚点重写引用片段（相似度阈值 0.6）；
@@ -63,6 +69,7 @@ pytest
 | `POST` | `/api/validations` | 对某导入批次发起校验（后台任务）→ `validation_id` |
 | `GET` | `/api/validations` | 最近校验任务列表 |
 | `GET` | `/api/validations/{validation_id}` | 任务状态 + 诊断（`?type=`、`?path=` 过滤） |
+| `GET` | `/api/validations/{validation_id}/sarif` | SARIF 2.1.0 导出（任务须为 `done`；未完成返回 409，不存在返回 404） |
 | `POST` | `/api/validations/{validation_id}/fix-preview` | 修复预览（任务须为 `done`） |
 
 ### 示例
@@ -87,6 +94,60 @@ curl 'localhost:8000/api/validations/<validation_id>?type=broken_link&path=READM
 
 # 4. 修复预览
 curl -X POST localhost:8000/api/validations/<validation_id>/fix-preview
+```
+
+也可以导出 SARIF（校验完成前调用返回 `409`）：
+
+```bash
+curl localhost:8000/api/validations/<validation_id>/sarif -o validation.sarif
+```
+
+SARIF 导出片段（每条规则在 `tool.driver.rules` 中声明，result 通过 `ruleId`/`ruleIndex`
+引用；路径为相对 artifact URI，行号在 `region.startLine`，明细在 `properties`）：
+
+```json
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {"driver": {
+        "name": "markdown-reference-validator", "version": "1.0.0",
+        "rules": [
+          {"id": "broken_link", "name": "BrokenMarkdownLink",
+           "defaultConfiguration": {"level": "error"}},
+          {"id": "broken_anchor", "name": "BrokenMarkdownAnchor",
+           "defaultConfiguration": {"level": "error"}},
+          {"id": "anchor_collision", "name": "DuplicateHeadingAnchor",
+           "defaultConfiguration": {"level": "warning"}},
+          {"id": "cycle", "name": "CircularReference",
+           "defaultConfiguration": {"level": "warning"}}
+        ]
+      }},
+      "automationDetails": {"id": "validation/<validation_id>"},
+      "results": [
+        {
+          "ruleId": "broken_anchor", "ruleIndex": 1, "level": "error",
+          "message": {"text": "anchor '#安装' not found in 'docs/setup.md'"},
+          "locations": [{"physicalLocation": {
+            "artifactLocation": {"uri": "README.md"},
+            "region": {"startLine": 3}
+          }}],
+          "properties": {"severity": "error", "fragment": "安装",
+                        "resolved": "docs/setup.md", "available": ["安装", "步骤", "步骤-1"]}
+        },
+        {
+          "ruleId": "cycle", "ruleIndex": 3, "level": "warning",
+          "message": {"text": "circular reference detected: a.md -> b.md -> a.md"},
+          "locations": [{"physicalLocation": {
+            "artifactLocation": {"uri": "a.md"}
+          }}],
+          "properties": {"severity": "warning", "cycle": ["a.md", "b.md"]}
+        }
+      ]
+    }
+  ]
+}
 ```
 
 修复预览响应：
@@ -130,6 +191,7 @@ app/
   parser.py    # Markdown 解析：标题/锚点/链接/代码块
   analyzer.py  # 引用图构建与诊断（断链/断锚/碰撞/环）
   fixer.py     # 修复预览：最小化重写锚点与引用
+  sarif.py     # SARIF 2.1.0 导出：诊断 -> runs/results
   db.py        # SQLite 持久层（imports / documents / validations / diagnostics）
   schemas.py   # 请求模型与路径校验
 tests/

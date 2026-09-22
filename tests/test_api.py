@@ -280,3 +280,149 @@ def test_crlf_preserved_in_fix_preview(client):
     fixed = preview["fixed_documents"][0]["fixed_content"]
     assert "\r\n" in fixed
     assert fixed.split("\r\n")[4] == "## Dup  {#dup-1}"
+
+
+# ------------------------------------------------------------ sarif export --
+
+def _sarif_tuples(sarif):
+    out = []
+    for r in sarif["runs"][0]["results"]:
+        loc = r["locations"][0]["physicalLocation"]
+        line = loc.get("region", {}).get("startLine")
+        out.append((r["ruleId"], loc["artifactLocation"]["uri"], line))
+    return out
+
+
+def test_sarif_export_maps_all_diagnostics(client):
+    _, vid, body = import_and_validate(client, CORPUS)
+
+    r = client.get(f"/api/validations/{vid}/sarif")
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"] == "application/sarif+json"
+    assert vid in r.headers["content-disposition"]
+
+    sarif = r.json()
+    assert sarif["version"] == "2.1.0"
+    assert sarif["$schema"].endswith("sarif-2.1.0.json")
+    assert len(sarif["runs"]) == 1
+    run = sarif["runs"][0]
+    assert run["automationDetails"]["id"] == f"validation/{vid}"
+
+    driver = run["tool"]["driver"]
+    assert driver["name"] == "markdown-reference-validator"
+    assert driver["version"]
+    rule_ids = [rule["id"] for rule in driver["rules"]]
+    assert rule_ids == ["broken_link", "broken_anchor", "anchor_collision", "cycle"]
+    rule_levels = {rule["id"]: rule["defaultConfiguration"]["level"] for rule in driver["rules"]}
+    assert rule_levels == {
+        "broken_link": "error",
+        "broken_anchor": "error",
+        "anchor_collision": "warning",
+        "cycle": "warning",
+    }
+
+    results = run["results"]
+    assert len(results) == body["summary"]["diagnostics"] == 8
+
+    # stable, path/line-oriented order (document-level cycles sort first)
+    assert _sarif_tuples(sarif) == [
+        ("cycle", "docs/api.md", None),
+        ("broken_anchor", "docs/api.md", 3),
+        ("cycle", "docs/guide.md", None),
+        ("anchor_collision", "docs/guide.md", 7),
+        ("broken_link", "docs/guide.md", 9),
+        ("broken_anchor", "docs/old/deep.md", 5),
+        ("cycle", "index.md", None),
+        ("broken_link", "index.md", 3),
+    ]
+
+    levels = {res["ruleId"]: res["level"] for res in results}
+    assert levels["broken_link"] == "error"
+    assert levels["broken_anchor"] == "error"
+    assert levels["anchor_collision"] == "warning"
+    assert levels["cycle"] == "warning"
+
+    # every result points at its rule and carries a locatable message
+    rule_index = {rule["id"]: i for i, rule in enumerate(driver["rules"])}
+    for res in results:
+        assert res["ruleIndex"] == rule_index[res["ruleId"]]
+        assert res["message"]["text"].strip()
+        assert res["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+        assert res["properties"]["severity"] == res["level"]
+
+    # line numbers are present for link/heading diagnostics, absent for cycles
+    by_key = {(t[0], t[1], t[2]): res for t, res in zip(_sarif_tuples(sarif), results)}
+    broken_link = by_key[("broken_link", "index.md", 3)]
+    assert broken_link["properties"]["resolved"] == "docs/nope.md"
+
+    broken_anchor = by_key[("broken_anchor", "docs/api.md", 3)]
+    assert broken_anchor["properties"]["fragment"] == "instal"
+    assert broken_anchor["properties"]["resolved"] == "docs/guide.md"
+    assert "install" in broken_anchor["properties"]["available"]
+
+    collision = by_key[("anchor_collision", "docs/guide.md", 7)]
+    assert collision["properties"]["assigned"] == "install-1"
+
+    cycle = by_key[("cycle", "docs/guide.md", None)]
+    assert set(cycle["properties"]["cycle"]) == {"index.md", "docs/guide.md", "docs/api.md"}
+    assert "region" not in cycle["locations"][0]["physicalLocation"]
+
+
+def test_sarif_export_order_is_stable(client):
+    _, vid, _ = import_and_validate(client, CORPUS)
+    first = client.get(f"/api/validations/{vid}/sarif").json()
+    second = client.get(f"/api/validations/{vid}/sarif").json()
+    assert first == second
+    # and matches the diagnostics endpoint ordering for line-bearing issues
+    diags = client.get(f"/api/validations/{vid}").json()["diagnostics"]
+    sarif_keys = [
+        (r["ruleId"], r["locations"][0]["physicalLocation"]["artifactLocation"]["uri"])
+        for r in first["runs"][0]["results"]
+    ]
+    diag_keys = [(d["type"], d["path"]) for d in diags]
+    assert sarif_keys == diag_keys
+
+
+def test_sarif_export_not_found_and_requires_done(client, tmp_path, monkeypatch):
+    assert client.get("/api/validations/does-not-exist/sarif").status_code == 404
+
+    from app import db
+
+    import_id = db.create_import({"a.md": "# A\n"})
+    vid = db.create_validation(import_id)  # stays 'pending'
+    r = client.get(f"/api/validations/{vid}/sarif")
+    assert r.status_code == 409
+    assert "pending" in r.json()["detail"]
+
+
+def test_sarif_export_empty_when_no_diagnostics(client):
+    _, vid, _ = import_and_validate(
+        client, {"a.md": "# A\n\nNo links here.\n"}
+    )
+    r = client.get(f"/api/validations/{vid}/sarif")
+    assert r.status_code == 200, r.text
+    run = r.json()["runs"][0]
+    assert run["results"] == []
+    assert len(run["tool"]["driver"]["rules"]) == 4
+
+
+def test_sarif_artifact_uri_is_percent_encoded(tmp_path, monkeypatch):
+    from app.sarif import build_sarif
+
+    diags = [
+        {
+            "id": 2,
+            "type": "broken_link",
+            "severity": "error",
+            "path": "my docs/中文 a.md",
+            "line": 1,
+            "message": "x",
+            "details": {},
+        },
+    ]
+    sarif = build_sarif({"id": "v1"}, diags, tool_version="1.0.0")
+    uri = sarif["runs"][0]["results"][0]["locations"][0]["physicalLocation"][
+        "artifactLocation"
+    ]["uri"]
+    assert uri == "my%20docs/%E4%B8%AD%E6%96%87%20a.md"
+

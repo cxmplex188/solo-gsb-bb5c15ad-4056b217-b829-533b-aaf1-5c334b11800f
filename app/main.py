@@ -4,10 +4,12 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
 
 from . import db
 from .analyzer import analyze
 from .fixer import build_fix_preview
+from .sarif import build_sarif
 from .schemas import ImportRequest, ValidationRequest, normalize_doc_path
 
 
@@ -150,6 +152,34 @@ def get_validation(
             for d in diagnostics
         ],
     }
+
+
+# -------------------------------------------------------------- sarif export ---
+
+@app.get(
+    "/api/validations/{validation_id}/sarif",
+    responses={200: {"content": {"application/sarif+json": {}}}},
+)
+def export_validation_sarif(validation_id: str) -> JSONResponse:
+    v = db.get_validation(validation_id)
+    if not v:
+        raise HTTPException(status_code=404, detail="validation not found")
+    if v["status"] != "done":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"validation is {v['status']}; SARIF export requires status 'done'"
+            ),
+        )
+    diagnostics = db.list_diagnostics(validation_id)
+    sarif = build_sarif(v, diagnostics, tool_version=app.version)
+    return JSONResponse(
+        content=sarif,
+        media_type="application/sarif+json",
+        headers={
+            "Content-Disposition": f'attachment; filename="validation-{validation_id}.sarif"'
+        },
+    )
 
 
 # ------------------------------------------------------------ fix preview ---
